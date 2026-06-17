@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+checkpoints_stage1/
+checkpoints_stage2/
+checkpoints_stage3/
+logs_stage1/
+logs_stage2/
+logs_stage3/
+*.pkl
+hexapod_rl_project_v1.zip
+venv/
+.DS_Store
