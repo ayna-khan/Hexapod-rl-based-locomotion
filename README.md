@@ -38,18 +38,22 @@ pip install -r requirements.txt
 
 ## Project Structure
 hexapod-rl/
-
+│
 ├── urdf/
 │   └── hexapod_generated.urdf      # Robot description
+│
 ├── hexapod_env_stage1.py           # Stage 1 Gymnasium environment
 ├── hexapod_env_stage2.py           # Stage 2 Gymnasium environment
-├── hexapod_env_stage3.py           # Stage 3 Gymnasium environment (A* planner)
+├── hexapod_env_stage3.py           # Stage 3 Gymnasium environment 
+│
 ├── train_stage1.py                 # Stage 1 PPO training script
 ├── train_stage2.py                 # Stage 2 PPO training script
 ├── train_stage3.py                 # Stage 3 PPO training script
+│
 ├── visualize_stage1.py             # Watch Stage 1 trained agent
 ├── visualize_stage2.py             # Watch Stage 2 trained agent
 ├── visualize_stage3.py             # Watch Stage 3 trained agent
+│
 ├── requirements.txt
 └── README.md         
 ---
