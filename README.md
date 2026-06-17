@@ -37,7 +37,9 @@ pip install -r requirements.txt
 ---
 
 ## Project Structure
-hexapod-rl/
+```
+
+hexapod-rl-bases-locomtion/
 │
 ├── urdf/
 │   └── hexapod_generated.urdf      # Robot description
@@ -55,7 +57,9 @@ hexapod-rl/
 ├── visualize_stage3.py             # Watch Stage 3 trained agent
 │
 ├── requirements.txt
-└── README.md         
+└── README.md
+```
+    
 ---
 
 ## Training
