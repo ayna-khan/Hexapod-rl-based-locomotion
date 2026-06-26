@@ -2,9 +2,9 @@
 CRAWL — Watch the trained hexapod (Stage 1)
 
 Usage:
-  python3 enjoy.py
-  python3 enjoy.py --steps 2000
-  python3 enjoy.py --no-norm    # skip normalizer (debug)
+  python3 visualize_stage1.py
+  python3 visualize_stage1.py --steps 2000
+  python3 visualize_stage1.py --no-norm    # skip normalizer (debug)
 """
 
 import os

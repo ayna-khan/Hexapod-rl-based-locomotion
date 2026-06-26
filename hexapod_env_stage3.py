@@ -27,550 +27,340 @@ distances.
 """
 
 import os
-import heapq
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import pybullet as p
 import pybullet_data
+import hexapod_env_stage2 as stage2
 
-URDF = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                    "urdf", "hexapod_generated.urdf")
+from hexapod_env_stage2 import (
+    URDF, SPAWN_Z, TARGET_HEIGHT,
+    SIM_HZ, CTRL_HZ, SIM_STEPS_PER_CTRL, NUM_JOINTS, SERVO_FORCE, MIN_HEIGHT, MAX_TILT,
+)
 
-# ── Joint limits (18 DOF: coxa, femur, tibia × 6) ───────────────────────────
-JOINT_LOWER = np.array([-0.785, -1.571, -1.571] * 6, dtype=np.float32)
-JOINT_UPPER = np.array([ 0.785,  0.524,  1.571] * 6, dtype=np.float32)
+ACT_DIM = 9
+OBS_DIM = 57          # Stage2's 53 + goal_dir(2) + dist_norm(1) + heading_err(1)
+MAX_EPISODE_STEPS = 2000
 
-# ── Simulation constants ──────────────────────────────────────────────────────
-NUM_JOINTS         = 18
-SIM_HZ             = 240
-CTRL_HZ            = 50
-SIM_STEPS_PER_CTRL = SIM_HZ // CTRL_HZ
-MAX_EPISODE_STEPS  = 2000         
-SERVO_FORCE        = 25.0
+GOAL_RADIUS   = 0.15
+GOAL_MIN_DIST = 0.8
+GOAL_MAX_DIST = 3.0
+GRACE_STEPS   = 150
 
-# ── Standing pose ─────────────────
-STAND_POSE    = [0.0, 0.52, 1.00] * 6
-TARGET_HEIGHT = 0.1508
-SPAWN_Z       = 0.1508
-
-# ── Termination thresholds ───────────────────────────────────────────────────
-MIN_HEIGHT    = 0.08
-MAX_TILT      = 0.60
-
-# ── Action scale per joint type (radians / step) ─────────────────────────────
-ACTION_SCALE  = np.array([0.25, 0.15, 0.20] * 6, dtype=np.float32)
-
-# ── Goal parameters ───────────────────────────────────────────────────────────
-GOAL_RADIUS       = 0.15    # m — success threshold
-GOAL_MIN_DIST     = 0.8     # m — minimum spawn-to-goal distance
-GOAL_MAX_DIST     = 3.0     # m — maximum spawn-to-goal distance
-SUBGOAL_LOOKAHEAD = 3       # waypoints ahead to use as local subgoal
-
-# ── Observation dimension ────────────────────────────────────────────────────
-#   Stage-2 obs : 68  (lin_vel×3, ang_vel×3, euler×2, jpos×18, jvel×18, prev_act×18)
-#   goal_vec_2D :  2  (relative x,y to current subgoal, normalised)
-#   dist_to_goal:  1  (scalar, normalised by GOAL_MAX_DIST)
-#   heading_err :  1  (angle between body heading and goal direction)
-OBS_DIM_STAGE2 = 68
-EXTRA_OBS      = 4
-OBS_DIM        = OBS_DIM_STAGE2 + EXTRA_OBS   # 72
-ACT_DIM        = 18
-
-# ── Reward weights ────────────────────────────────────────────────────────────
-W_PROGRESS    =  8.0    # potential-based progress per step
-W_GOAL        = 200.0   # sparse bonus on success
-W_HEADING     = -0.5    # penalise yawing away from goal
+W_VEL_TOWARD  =  5.0
+W_PROGRESS    = 15.0
+W_GOAL        = 200.0
 W_HEIGHT      =  2.0
 W_TILT        = -2.0
 W_ALIVE       =  0.1
 W_ENERGY      = -0.001
-W_ACTION_RATE = -0.003
+W_ACTION_RATE = -0.01
+W_STALL       = -2.0
+STALL_STEPS   = 20
+STALL_THRESH  = 0.005
+W_HEADING     = 1.5
 
+def _slice(leg_id):
+    i = leg_id - 1
+    return slice(3 * i, 3 * i + 3)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  A*  PATH  PLANNER  (2-D grid)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class AStarPlanner:
+def expand_goal_steering_targets(action9, heading_err, step_count):
     """
-    Lightweight 2-D A* on a uniform occupancy grid.
-
-    Parameters
-    ----------
-    resolution : float   — metres per cell
-    half_extent : float  — arena half-size in metres (square grid)
+    Stage 3 walking target with goal steering.
+    heading_err:
+      positive = goal is to the left
+      negative = goal is to the right
     """
+    action9 = np.clip(action9, -1.0, 1.0).astype(np.float32)
 
-    def __init__(self, resolution: float = 0.05, half_extent: float = 4.0):
-        self.res         = resolution
-        self.half        = half_extent
-        self.n_cells     = int(2 * half_extent / resolution)
-        # occupancy grid — 0 free, 1 occupied  (flat arena → all 0)
-        self.grid        = np.zeros((self.n_cells, self.n_cells), dtype=np.uint8)
+    full = np.zeros(18, dtype=np.float32)
 
-    # ── coordinate helpers ────────────────────────────────────────────────────
-    def _w2g(self, wx: float, wy: float):
-        """World coords → grid indices (row, col)."""
-        col = int((wx + self.half) / self.res)
-        row = int((wy + self.half) / self.res)
-        col = max(0, min(self.n_cells - 1, col))
-        row = max(0, min(self.n_cells - 1, row))
-        return row, col
+    phase = 2.0 * np.pi * stage2.GAIT_FREQ * (step_count / CTRL_HZ)
 
-    def _g2w(self, row: int, col: int):
-        """Grid indices → world coords (centre of cell)."""
-        wx = col * self.res - self.half + self.res / 2
-        wy = row * self.res - self.half + self.res / 2
-        return wx, wy
+    stand_coxa = 0.0
+    stand_femur = 0.35
+    stand_tibia = 1.05
 
-    # ── A* ────────────────────────────────────────────────────────────────────
-    def plan(self, start_xy, goal_xy):
-        """
-        Returns a list of (x, y) world-coord waypoints from start to goal.
-        Falls back to a straight line if start == goal or grid is tiny.
-        """
-        sr, sc = self._w2g(*start_xy)
-        gr, gc = self._w2g(*goal_xy)
+    base_coxa_amp = -0.38
+    femur_lift_amp = 0.34
+    tibia_lift_amp = 0.22
 
-        if (sr, sc) == (gr, gc):
-            return [goal_xy]
+    # Clamp steering so it does not flip the robot.
+    steer = float(np.clip(heading_err / 1.2, -1.0, 1.0))
 
-        open_heap = []
-        heapq.heappush(open_heap, (0.0, sr, sc))
-        came_from = {}
-        g_cost    = {(sr, sc): 0.0}
+    # If goal is left, right side takes bigger steps.
+    left_scale = np.clip(1.0 - 0.45 * steer, 0.45, 1.55)
+    right_scale = np.clip(1.0 + 0.45 * steer, 0.45, 1.55)
 
-        def h(r, c):
-            return abs(r - gr) + abs(c - gc)          # Manhattan heuristic
+    # left leg IDs and corresponding right IDs
+    pairs = [
+        (2, 1, phase),             # front
+        (3, 6, phase + np.pi),     # middle
+        (4, 5, phase),             # rear
+    ]
 
-        neighbors = [(-1,0),(1,0),(0,-1),(0,1),
-                     (-1,-1),(-1,1),(1,-1),(1,1)]     # 8-connected
+    groups = [action9[0:3], action9[3:6], action9[6:9]]
 
-        while open_heap:
-            f, r, c = heapq.heappop(open_heap)
-            if (r, c) == (gr, gc):
-                break
-            for dr, dc in neighbors:
-                nr, nc = r + dr, c + dc
-                if not (0 <= nr < self.n_cells and 0 <= nc < self.n_cells):
-                    continue
-                if self.grid[nr, nc]:
-                    continue
-                step = 1.414 if (dr != 0 and dc != 0) else 1.0
-                ng   = g_cost[(r, c)] + step
-                if ng < g_cost.get((nr, nc), float("inf")):
-                    g_cost[(nr, nc)] = ng
-                    came_from[(nr, nc)] = (r, c)
-                    heapq.heappush(open_heap, (ng + h(nr, nc), nr, nc))
-        else:
-            # No path found — return straight line
-            return [goal_xy]
+    for (left_id, right_id, ph), g in zip(pairs, groups):
+        swing = np.sin(ph)
+        lift = max(0.0, np.cos(ph))
 
-        # Reconstruct path
-        path = []
-        node = (gr, gc)
-        while node in came_from:
-            path.append(self._g2w(*node))
-            node = came_from[node]
-        path.append(self._g2w(sr, sc))
-        path.reverse()
+        right_swing = -swing
+        right_lift = max(0.0, -np.cos(ph))
 
-        # Thin the waypoints (keep every 4th + last)
-        thinned = path[::4]
-        if thinned[-1] != path[-1]:
-            thinned.append(path[-1])
-        return thinned
+        coxa_res = 0.06 * float(g[0])
+        femur_res = 0.06 * float(g[1])
+        tibia_res = 0.06 * float(g[2])
 
+        left_coxa = stand_coxa + left_scale * base_coxa_amp * swing + coxa_res
+        left_femur = stand_femur - femur_lift_amp * lift + femur_res
+        left_tibia = stand_tibia - tibia_lift_amp * lift + tibia_res
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENVIRONMENT
-# ═══════════════════════════════════════════════════════════════════════════════
+        right_coxa = -(stand_coxa + right_scale * base_coxa_amp * right_swing + coxa_res)
+        right_femur = stand_femur - femur_lift_amp * right_lift + femur_res
+        right_tibia = stand_tibia - tibia_lift_amp * right_lift + tibia_res
+
+        full[_slice(left_id)] = [left_coxa, left_femur, left_tibia]
+        full[_slice(right_id)] = [right_coxa, right_femur, right_tibia]
+
+    return np.clip(full, stage2.JOINT_LOWER, stage2.JOINT_UPPER).astype(np.float32)
+
 
 class HexapodGoalEnv(gym.Env):
-    """
-    Stage-3 goal-reaching environment.
-
-    Observation (66-D):
-        [lin_vel(3), ang_vel(3), euler(2), jpos(18), jvel(18), prev_act(18),
-         rel_subgoal_x, rel_subgoal_y, dist_to_goal_norm, heading_error]
-
-    Action (18-D):
-        Joint-angle deltas ∈ [-1, 1], scaled by ACTION_SCALE.
-    """
-
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": CTRL_HZ}
 
-    def __init__(self, render_mode=None,
-                 goal_xy=None,
-                 arena_half=3.0):
+    def __init__(self, render_mode=None, goal_xy=None, max_goal_dist=GOAL_MAX_DIST):
         super().__init__()
-        self.render_mode  = render_mode
-        self.fixed_goal   = goal_xy      # None → random every episode
-        self.arena_half   = arena_half
-        self.planner      = AStarPlanner(resolution=0.05,
-                                         half_extent=arena_half + 1.0)
+        self.render_mode = render_mode
+        self.fixed_goal = goal_xy
+        self._max_goal_dist = float(max_goal_dist)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(ACT_DIM,), dtype=np.float32)
+        self._client = None
+        self._robot = None
+        self._goal_body = None
+        self._joint_ids = []
+        self._step_count = 0
+        self._prev_action = np.zeros(ACT_DIM, dtype=np.float32)
+        self._goal_xy = np.zeros(2, dtype=np.float32)
+        self._prev_dist = 0.0
+        self._stall_buf = []
 
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32)
-        self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(ACT_DIM,), dtype=np.float32)
-
-        self._client        = None
-        self._robot         = None
-        self._goal_body     = None
-        self._joint_ids     = []
-        self._step_count    = 0
-        self._prev_action   = np.zeros(ACT_DIM, dtype=np.float32)
-        self._current_joints = np.array(STAND_POSE, dtype=np.float32)
-
-        # Navigation state
-        self._goal_xy       = np.zeros(2, dtype=np.float32)
-        self._waypoints     = []
-        self._wp_idx        = 0
-        self._prev_dist     = 0.0
-
-    # ── Physics setup ─────────────────────────────────────────────────────────
+    def set_max_goal_dist(self, d):
+        self._max_goal_dist = float(d)
 
     def _build_joint_index(self):
         self._joint_ids = []
-        for i in range(p.getNumJoints(self._robot,
-                                       physicsClientId=self._client)):
-            info = p.getJointInfo(self._robot, i,
-                                  physicsClientId=self._client)
+        for i in range(p.getNumJoints(self._robot, physicsClientId=self._client)):
+            info = p.getJointInfo(self._robot, i, physicsClientId=self._client)
             if info[2] == p.JOINT_REVOLUTE:
                 self._joint_ids.append(i)
-        assert len(self._joint_ids) == NUM_JOINTS, \
-            f"Expected {NUM_JOINTS} revolute joints, got {len(self._joint_ids)}"
+        assert len(self._joint_ids) == NUM_JOINTS
 
     def _spawn_goal_marker(self, gx, gy):
-        """Draw a small red sphere at the goal location (visual only)."""
         if self._goal_body is not None:
             try:
-                p.removeBody(self._goal_body,
-                             physicsClientId=self._client)
+                p.removeBody(self._goal_body, physicsClientId=self._client)
             except Exception:
                 pass
-        vis = p.createVisualShape(
-            p.GEOM_SPHERE, radius=0.05,
-            rgbaColor=[1, 0, 0, 0.8],
-            physicsClientId=self._client)
-        self._goal_body = p.createMultiBody(
-            baseMass=0,
-            baseVisualShapeIndex=vis,
-            basePosition=[gx, gy, 0.05],
-            physicsClientId=self._client)
-
-    # ── Reset ─────────────────────────────────────────────────────────────────
+        vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.05, rgbaColor=[1, 0, 0, 0.8],
+                                   physicsClientId=self._client)
+        self._goal_body = p.createMultiBody(baseMass=0, baseVisualShapeIndex=vis,
+                                              basePosition=[gx, gy, 0.05], physicsClientId=self._client)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-
-        # ── Connect / reset simulator ─────────────────────────────────────────
         if self._client is None:
             if self.render_mode == "human":
                 self._client = p.connect(p.GUI)
-                p.resetDebugVisualizerCamera(
-                    2.5, 45, -30, [0, 0, 0.15],
-                    physicsClientId=self._client)
-                p.configureDebugVisualizer(
-                    p.COV_ENABLE_GUI, 0,
-                    physicsClientId=self._client)
+                p.resetDebugVisualizerCamera(2.0, 45, -30, [0, 0, 0.10], physicsClientId=self._client)
+                p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self._client)
             else:
                 self._client = p.connect(p.DIRECT)
 
         p.resetSimulation(physicsClientId=self._client)
-        p.setAdditionalSearchPath(
-            pybullet_data.getDataPath(),
-            physicsClientId=self._client)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=self._client)
         p.setGravity(0, 0, -9.81, physicsClientId=self._client)
         p.setTimeStep(1.0 / SIM_HZ, physicsClientId=self._client)
         p.loadURDF("plane.urdf", physicsClientId=self._client)
 
-        # ── Spawn hexapod at confirmed standing height ────────────────────────
-        self._robot = p.loadURDF(
-            URDF, [0, 0, SPAWN_Z],
-            p.getQuaternionFromEuler([0, 0, 0]),
-            useFixedBase=False,
-            physicsClientId=self._client)
+        self._robot = p.loadURDF(URDF, [0, 0, SPAWN_Z], p.getQuaternionFromEuler([0, 0, 0]),
+                                  useFixedBase=False, physicsClientId=self._client)
         self._build_joint_index()
         self._goal_body = None
 
-        for link_idx in range(-1, p.getNumJoints(
-                self._robot, physicsClientId=self._client)):
-            p.changeDynamics(
-                self._robot, link_idx,
-                lateralFriction=1.5,
-                spinningFriction=0.1,
-                rollingFriction=0.01,
-                physicsClientId=self._client)
+        for link_idx in range(-1, p.getNumJoints(self._robot, physicsClientId=self._client)):
+            p.changeDynamics(self._robot, link_idx, lateralFriction=2.5, spinningFriction=0.3,
+                              rollingFriction=0.01, frictionAnchor=1, physicsClientId=self._client)
 
-        # Apply confirmed standing pose
+        stage2.CURRENT_STEP_FRAC = 0.0
+        neutral18 = stage2.expand_mirrored_targets(np.zeros(9, dtype=np.float32))
         for idx, jid in enumerate(self._joint_ids):
-            p.resetJointState(
-                self._robot, jid, STAND_POSE[idx],
-                physicsClientId=self._client)
-            p.setJointMotorControl2(
-                self._robot, jid, p.POSITION_CONTROL,
-                targetPosition=STAND_POSE[idx],
-                force=SERVO_FORCE,
-                physicsClientId=self._client)
-
-        # Settle physics (10 steps only — same as Stage 2)
-        for _ in range(10):
+            p.resetJointState(self._robot, jid, float(neutral18[idx]), physicsClientId=self._client)
+            p.setJointMotorControl2(self._robot, jid, p.POSITION_CONTROL,
+                targetPosition=float(neutral18[idx]), force=SERVO_FORCE, physicsClientId=self._client)
+        for _ in range(20):
             p.stepSimulation(physicsClientId=self._client)
-        p.resetBaseVelocity(
-            self._robot, [0, 0, 0], [0, 0, 0],
-            physicsClientId=self._client)
+        p.resetBaseVelocity(self._robot, [0, 0, 0], [0, 0, 0], physicsClientId=self._client)
 
-        # ── Sample goal ───────────────────────────────────────────────────────
         if self.fixed_goal is not None:
             self._goal_xy = np.array(self.fixed_goal, dtype=np.float32)
         else:
             rng = self.np_random
-            for _ in range(200):
-                angle = rng.uniform(0, 2 * np.pi)
-                dist  = rng.uniform(GOAL_MIN_DIST, GOAL_MAX_DIST)
-                gx    = float(dist * np.cos(angle))
-                gy    = float(dist * np.sin(angle))
-                if abs(gx) < self.arena_half and abs(gy) < self.arena_half:
-                    self._goal_xy = np.array([gx, gy], dtype=np.float32)
-                    break
+            angle = rng.uniform(0, 2 * np.pi)
+            dist = rng.uniform(GOAL_MIN_DIST, self._max_goal_dist)
+            self._goal_xy = np.array([dist * np.cos(angle), dist * np.sin(angle)], dtype=np.float32)
 
-        # ── Plan path ─────────────────────────────────────────────────────────
-        start = (0.0, 0.0)
-        goal  = (float(self._goal_xy[0]), float(self._goal_xy[1]))
-        self._waypoints = self.planner.plan(start, goal)
-        self._wp_idx    = 0
-
-        # ── Goal marker (visual) ──────────────────────────────────────────────
         self._spawn_goal_marker(*self._goal_xy)
         if self.render_mode == "human":
-            self._draw_path_debug()
+            try:
+                p.removeAllUserDebugItems(physicsClientId=self._client)
+                p.addUserDebugLine([0, 0, 0.02], [float(self._goal_xy[0]), float(self._goal_xy[1]), 0.02],
+                                    lineColorRGB=[0, 1, 0], lineWidth=3.0, physicsClientId=self._client)
+            except Exception:
+                pass
 
-        # ── State reset ───────────────────────────────────────────────────────
-        self._step_count    = 0
-        self._prev_action   = np.zeros(ACT_DIM, dtype=np.float32)
-        self._current_joints = np.array(STAND_POSE, dtype=np.float32)
-        pos, _              = p.getBasePositionAndOrientation(
-            self._robot, physicsClientId=self._client)
-        self._prev_dist     = float(np.linalg.norm(
-            np.array([pos[0], pos[1]]) - self._goal_xy))
+        self._step_count = 0
+        self._prev_action = np.zeros(ACT_DIM, dtype=np.float32)
+        pos, _ = p.getBasePositionAndOrientation(self._robot, physicsClientId=self._client)
+        self._prev_dist = float(np.linalg.norm(np.array([pos[0], pos[1]]) - self._goal_xy))
+        self._stall_buf = [self._prev_dist] * STALL_STEPS
 
         return self._get_obs(), {"goal_xy": self._goal_xy.tolist()}
 
-    def _draw_path_debug(self):
-        """Draw the A* path as green debug lines (GUI mode only)."""
-        if not self._waypoints:
-            return
-        pts = [(wp[0], wp[1], 0.02) for wp in self._waypoints]
-        for i in range(len(pts) - 1):
-            p.addUserDebugLine(pts[i], pts[i+1],
-                               lineColorRGB=[0, 1, 0],
-                               lineWidth=2.0,
-                               physicsClientId=self._client)
-
-    # ── Step ──────────────────────────────────────────────────────────────────
-
     def step(self, action):
-        # Delta joint control (identical to Stage 2)
-        delta = action * ACTION_SCALE
-        self._current_joints = np.clip(
-            self._current_joints + delta,
-            JOINT_LOWER, JOINT_UPPER)
+        action = np.clip(action, -1.0, 1.0).astype(np.float32)
+        pos, orn = p.getBasePositionAndOrientation(
+            self._robot,
+            physicsClientId=self._client,
+        )
+        yaw = p.getEulerFromQuaternion(orn)[2]
 
+        goal_angle = float(np.arctan2(
+            self._goal_xy[1] - pos[1],
+            self._goal_xy[0] - pos[0],
+        ))
+
+        heading_err = float(np.arctan2(
+            np.sin(goal_angle - yaw),
+            np.cos(goal_angle - yaw),
+        ))
+
+        target18 = expand_goal_steering_targets(
+            action,
+            heading_err,
+            self._step_count,
+        )
         for idx, jid in enumerate(self._joint_ids):
-            p.setJointMotorControl2(
-                self._robot, jid, p.POSITION_CONTROL,
-                targetPosition=float(self._current_joints[idx]),
-                force=SERVO_FORCE,
-                physicsClientId=self._client)
-
+            p.setJointMotorControl2(self._robot, jid, p.POSITION_CONTROL,
+                targetPosition=float(target18[idx]), force=SERVO_FORCE, physicsClientId=self._client)
         for _ in range(SIM_STEPS_PER_CTRL):
             p.stepSimulation(physicsClientId=self._client)
 
-        # Advance waypoint index if close to current subgoal
-        self._update_waypoint()
-
-        obs               = self._get_obs()
+        obs = self._get_obs()
         reward, terminated, info = self._compute_reward(action)
         self._step_count += 1
-        truncated          = self._step_count >= MAX_EPISODE_STEPS
-        self._prev_action  = action.copy()
-
-        if terminated:
-            info["success"] = True
+        truncated = self._step_count >= MAX_EPISODE_STEPS
+        self._prev_action = action.copy()
         return obs, reward, terminated, truncated, info
 
-    def _update_waypoint(self):
-        """Pop waypoints as the robot passes close enough to them."""
-        if self._wp_idx >= len(self._waypoints):
-            return
-        pos, _ = p.getBasePositionAndOrientation(
-            self._robot, physicsClientId=self._client)
-        xy = np.array([pos[0], pos[1]], dtype=np.float32)
-        while self._wp_idx < len(self._waypoints):
-            wp  = np.array(self._waypoints[self._wp_idx], dtype=np.float32)
-            d   = float(np.linalg.norm(xy - wp))
-            if d < GOAL_RADIUS * 1.5:
-                self._wp_idx += 1
-            else:
-                break
-
-    # ── Observations ──────────────────────────────────────────────────────────
-
     def _get_obs(self):
-        pos, orn         = p.getBasePositionAndOrientation(
-            self._robot, physicsClientId=self._client)
-        lin_vel, ang_vel = p.getBaseVelocity(
-            self._robot, physicsClientId=self._client)
-        euler            = p.getEulerFromQuaternion(orn)
-
+        pos, orn = p.getBasePositionAndOrientation(self._robot, physicsClientId=self._client)
+        lin_vel, ang_vel = p.getBaseVelocity(self._robot, physicsClientId=self._client)
+        euler = p.getEulerFromQuaternion(orn)
         jpos, jvel = [], []
         for jid in self._joint_ids:
-            js = p.getJointState(self._robot, jid,
-                                 physicsClientId=self._client)
-            jpos.append(js[0])
-            jvel.append(js[1])
+            js = p.getJointState(self._robot, jid, physicsClientId=self._client)
+            jpos.append(js[0]); jvel.append(js[1])
 
-        # ── Goal / navigation extras ──────────────────────────────────────────
         xy = np.array([pos[0], pos[1]], dtype=np.float32)
+        rel_goal = self._goal_xy - xy
+        dist_goal = float(np.linalg.norm(rel_goal))
+        goal_dir = rel_goal / dist_goal if dist_goal > 1e-6 else np.zeros(2, dtype=np.float32)
+        dist_norm = float(np.clip(dist_goal / self._max_goal_dist, 0.0, 1.0))
 
-        # Current subgoal (lookahead along waypoint list)
-        subgoal_idx = min(self._wp_idx + SUBGOAL_LOOKAHEAD,
-                          len(self._waypoints) - 1)
-        if self._waypoints:
-            subgoal = np.array(self._waypoints[subgoal_idx], dtype=np.float32)
-        else:
-            subgoal = self._goal_xy.copy()
-
-        rel_sg   = subgoal - xy                         # 2-D relative vector
-        dist_sg  = float(np.linalg.norm(rel_sg))
-        if dist_sg > 1e-6:
-            rel_sg_norm = rel_sg / dist_sg
-        else:
-            rel_sg_norm = np.zeros(2, dtype=np.float32)
-
-        # Distance to final goal (normalised)
-        dist_goal      = float(np.linalg.norm(xy - self._goal_xy))
-        dist_goal_norm = np.clip(dist_goal / GOAL_MAX_DIST, 0.0, 1.0)
-
-        # Heading error: yaw vs direction to goal
-        yaw             = float(euler[2])
-        goal_dir_angle  = float(np.arctan2(
-            self._goal_xy[1] - pos[1],
-            self._goal_xy[0] - pos[0]))
-        heading_err     = float(np.arctan2(
-            np.sin(goal_dir_angle - yaw),
-            np.cos(goal_dir_angle - yaw)))
+        yaw = float(euler[2])
+        goal_angle = float(np.arctan2(self._goal_xy[1] - pos[1], self._goal_xy[0] - pos[0]))
+        heading_err = float(np.arctan2(np.sin(goal_angle - yaw), np.cos(goal_angle - yaw)))
 
         return np.concatenate([
-            lin_vel,                        # 3
-            ang_vel,                        # 3
-            [euler[0], euler[1]],           # 2
-            jpos,                           # 18
-            jvel,                           # 18
-            self._prev_action,              # 18
-            rel_sg_norm,                    # 2
-            [dist_goal_norm],               # 1
-            [heading_err / np.pi],          # 1  (normalised to [-1,1])
-        ]).astype(np.float32)               # total: 66
-
-    # ── Reward ────────────────────────────────────────────────────────────────
+            lin_vel, ang_vel, [euler[0], euler[1]], jpos, jvel, self._prev_action,
+            goal_dir, [dist_norm], [heading_err / np.pi],
+        ]).astype(np.float32)
 
     def _compute_reward(self, action):
-        pos, orn   = p.getBasePositionAndOrientation(
-            self._robot, physicsClientId=self._client)
-        lin_vel, _ = p.getBaseVelocity(
-            self._robot, physicsClientId=self._client)
-        euler      = p.getEulerFromQuaternion(orn)
+        pos, orn = p.getBasePositionAndOrientation(self._robot, physicsClientId=self._client)
+        lin_vel, _ = p.getBaseVelocity(self._robot, physicsClientId=self._client)
+        euler = p.getEulerFromQuaternion(orn)
 
-        xy         = np.array([pos[0], pos[1]], dtype=np.float32)
-        height     = float(pos[2])
-        tilt       = float(abs(euler[0]) + abs(euler[1]))
-        dist_goal  = float(np.linalg.norm(xy - self._goal_xy))
+        xy = np.array([pos[0], pos[1]], dtype=np.float32)
+        height = float(pos[2])
+        tilt = float(abs(euler[0]) + abs(euler[1]))
+        dist_goal = float(np.linalg.norm(xy - self._goal_xy))
 
-        # ── Potential-based progress ──────────────────────────────────────────
-        progress     = self._prev_dist - dist_goal   # positive = closer
+        progress = self._prev_dist - dist_goal
         self._prev_dist = dist_goal
 
-        # ── Height reward (same Gaussian as Stage 2) ──────────────────────────
-        height_rew  = float(np.exp(-20.0 * abs(height - TARGET_HEIGHT)))
+        self._stall_buf.pop(0)
+        self._stall_buf.append(dist_goal)
+        stall_penalty = W_STALL if (self._stall_buf[0] - self._stall_buf[-1]) < STALL_THRESH else 0.0
 
-        # ── Heading reward ────────────────────────────────────────────────────
-        yaw           = float(euler[2])
-        goal_dir      = float(np.arctan2(
+        rel_goal = self._goal_xy - xy
+        goal_unit = rel_goal / dist_goal if dist_goal > 1e-6 else np.zeros(2, dtype=np.float32)
+        vel_toward = float(np.dot([lin_vel[0], lin_vel[1]], goal_unit))
+
+        yaw = float(euler[2])
+        goal_angle = float(np.arctan2(
             self._goal_xy[1] - pos[1],
-            self._goal_xy[0] - pos[0]))
-        heading_err   = float(abs(np.arctan2(
-            np.sin(goal_dir - yaw),
-            np.cos(goal_dir - yaw))))
+            self._goal_xy[0] - pos[0],
+        ))
+        heading_err = float(np.arctan2(
+            np.sin(goal_angle - yaw),
+            np.cos(goal_angle - yaw),
+        ))
+        heading_reward = float(np.cos(heading_err))
 
-        # ── Energy ────────────────────────────────────────────────────────────
-        torques = [p.getJointState(self._robot, jid,
-                    physicsClientId=self._client)[3]
-                   for jid in self._joint_ids]
-        energy  = float(np.sum(np.abs(torques)))
-
-        # ── Action rate ───────────────────────────────────────────────────────
+        height_rew = float(np.exp(-20.0 * abs(height - TARGET_HEIGHT)))
+        torques = [p.getJointState(self._robot, jid, physicsClientId=self._client)[3] for jid in self._joint_ids]
+        energy = float(np.sum(np.abs(torques)))
         action_rate = float(np.sum(np.square(action - self._prev_action)))
 
         reward = (
-            W_PROGRESS    * progress +
-            W_HEADING     * heading_err +
-            W_HEIGHT      * height_rew +
-            W_TILT        * tilt +
-            W_ALIVE +
-            W_ENERGY      * energy +
-            W_ACTION_RATE * action_rate
+            W_VEL_TOWARD * vel_toward + W_PROGRESS * progress + stall_penalty
+            + W_HEIGHT * height_rew + W_TILT * tilt + W_ALIVE
+            + W_ENERGY * energy + W_ACTION_RATE * action_rate
+            + W_HEADING * heading_reward
         )
 
-        # ── Goal reached ──────────────────────────────────────────────────────
-        reached    = dist_goal < GOAL_RADIUS
         terminated = False
-        info       = {"dist_to_goal": dist_goal, "success": False}
-
-        if reached:
-            reward    += W_GOAL
+        info = {"dist_to_goal": dist_goal, "success": False}
+        if dist_goal < GOAL_RADIUS:
+            reward += W_GOAL
             terminated = True
             info["success"] = True
-
-        # ── Fall detection (grace period of 100 steps) ────────────────────────
-        elif self._step_count > 100 and (height < MIN_HEIGHT or tilt > MAX_TILT):
-            reward    -= 10.0
+        elif self._step_count > GRACE_STEPS and (height < MIN_HEIGHT or tilt > MAX_TILT):
+            reward -= 10.0
             terminated = True
 
         return float(reward), terminated, info
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
     def _get_foot_contacts(self):
-        """Count unique tibia links in contact with the ground."""
-        contacts = p.getContactPoints(
-            self._robot, physicsClientId=self._client)
-        ground_feet = set()
+        contacts = p.getContactPoints(self._robot, physicsClientId=self._client)
+        feet = set()
         if contacts:
             for c in contacts:
                 if c[2] != self._robot:
-                    ground_feet.add(c[3])
-        return len(ground_feet)
-
-    # ── Render ────────────────────────────────────────────────────────────────
+                    feet.add(c[3])
+        return len(feet)
 
     def render(self):
         if self.render_mode == "rgb_array":
-            w, h   = 640, 480
-            pos, _ = p.getBasePositionAndOrientation(
-                self._robot, physicsClientId=self._client)
-            view   = p.computeViewMatrixFromYawPitchRoll(
-                [pos[0], pos[1], 0.15], 2.5, 45, -30, 0, 2,
-                physicsClientId=self._client)
-            proj   = p.computeProjectionMatrixFOV(
-                60, w / h, 0.01, 100,
-                physicsClientId=self._client)
-            _, _, rgb, _, _ = p.getCameraImage(
-                w, h, view, proj,
-                physicsClientId=self._client)
+            w, h = 640, 480
+            pos, _ = p.getBasePositionAndOrientation(self._robot, physicsClientId=self._client)
+            view = p.computeViewMatrixFromYawPitchRoll([pos[0], pos[1], 0.10], 2.0, 45, -30, 0, 2, physicsClientId=self._client)
+            proj = p.computeProjectionMatrixFOV(60, w / h, 0.01, 100, physicsClientId=self._client)
+            _, _, rgb, _, _ = p.getCameraImage(w, h, view, proj, physicsClientId=self._client)
             return np.array(rgb, dtype=np.uint8)[:, :, :3]
 
     def close(self):
@@ -581,28 +371,15 @@ class HexapodGoalEnv(gym.Env):
 
 if __name__ == "__main__":
     import time
-
-    print("Stage-3 sanity check — zero actions, goal at (1.5, 0.0) …")
     env = HexapodGoalEnv(render_mode="human", goal_xy=[1.5, 0.0])
     obs, info = env.reset()
-    print(f"  Obs shape : {obs.shape}  (expected 66)")
-    print(f"  Goal      : {info['goal_xy']}")
-    print(f"  Waypoints : {len(env._waypoints)}")
-
-    pos, _ = p.getBasePositionAndOrientation(
-        env._robot, physicsClientId=env._client)
-    print(f"  Height    : {pos[2]:.4f} m  (expected ~0.1508)")
-
-    total = 0.0
-    for i in range(300):
-        obs, r, terminated, truncated, info = env.step(np.zeros(ACT_DIM))
-        total += r
+    print(f"Obs shape: {obs.shape} (expect {OBS_DIM})  Goal: {info['goal_xy']}")
+    for i in range(1500):
+        obs, r, term, trunc, info = env.step(np.zeros(9, dtype=np.float32))
+        if i % 50 == 0:
+            print(f"step={i}, dist={info['dist_to_goal']:.3f}, reward={r:.2f}")
         time.sleep(1 / CTRL_HZ)
-        if terminated or truncated:
-            print(f"  Episode ended at step {i} | reward={total:.1f} | "
-                  f"dist={info['dist_to_goal']:.3f} m")
+        if term or trunc:
+            print(f"Ended step {i}, dist={info['dist_to_goal']:.3f}")
             break
-    else:
-        print(f"  300 steps stable | reward={total:.1f} | "
-              f"dist={info['dist_to_goal']:.3f} m")
     env.close()

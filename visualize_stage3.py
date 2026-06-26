@@ -1,14 +1,14 @@
 """
-HEXAPOD — Stage 3 Enjoy: Watch the hexapod reach a goal 
+HEXAPOD — Stage 3 Visualize: Watch the hexapod reach a goal 
 ====================================================================
 
 Usage:
-  python3 enjoy_stage3.py                      # random goals, best model
-  python3 enjoy_stage3.py --goal 1.5 0.0       # fixed goal at (1.5, 0.0)
-  python3 enjoy_stage3.py --slow               # 0.5× real-time
-  python3 enjoy_stage3.py --fast               # no sleep
-  python3 enjoy_stage3.py --model path/to.zip  # specific checkpoint
-  python3 enjoy_stage3.py --episodes 5         # run N episodes then exit
+  python3 visualize_stage3.py                      # random goals, best model
+  python3 visualize_stage3.py --goal 1.5 0.0       # fixed goal at (1.5, 0.0)
+  python3 visualize_stage3.py --slow               # 0.5× real-time
+  python3 visualize_stage3.py --fast               # no sleep
+  python3 visualize_stage3.py --model path/to.zip  # specific checkpoint
+  python3 visualize_stage3.py --episodes 5         # run N episodes then exit
 """
 
 import os
@@ -22,7 +22,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 
-from train_stage3 import HexapodGoalEnvFixed, ACT_DIM
+from train_stage3 import HexapodGoalEnv, ACT_DIM
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 STAGE3_DIR = os.path.join(BASE_DIR, "checkpoints_stage3")
@@ -72,7 +72,7 @@ def main():
     goal_xy = args.goal
 
     def _make():
-        env = HexapodGoalEnvFixed(
+        env = HexapodGoalEnv(
             render_mode="human",
             goal_xy=goal_xy)
         return Monitor(env)

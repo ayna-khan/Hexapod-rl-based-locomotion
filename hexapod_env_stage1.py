@@ -1,9 +1,23 @@
 """
 CRAWL — Stage 1: Crouched spawn → Stand up
 ============================================
-CROUCH pose calculated from URDF geometry:
-  base_link box height = 0.024 m → COM at z=0.012 when bottom face on ground
-  femur = -0.6458 rad, tibia = +1.4522 rad → foot_z = 0.000 m  
+
+  - SIT_POSE  (coxa=0, femur=-0.6458, tibia=+1.4522) -> foot_z = -0.012 rel. to base
+  - STAND_POSE(coxa=0, femur=+0.45,   tibia=+1.05)   -> foot_z = -0.143 rel. to base
+
+Mirror law 
+  coxa_right  = -coxa_left
+  femur_right =  femur_left
+  tibia_right =  tibia_left
+
+Leg index map (URDF order, 3 joints/leg: coxa, femur, tibia):
+  leg1 = front-right   leg2 = front-left   leg3 = mid-left
+  leg4 = rear-left      leg5 = rear-right   leg6 = mid-right
+
+Mirrored pairs:  (left -> right)
+  front: leg2 -> leg1
+  mid:   leg3 -> leg6
+  rear:  leg4 -> leg5
 """
 
 import os
@@ -16,38 +30,58 @@ import pybullet_data
 URDF = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                     "urdf", "hexapod_generated.urdf")
 
-JOINT_LOWER = np.array([-0.785, -1.571, -1.571] * 6, dtype=np.float32)
-JOINT_UPPER = np.array([ 0.785,  0.524,  1.571] * 6, dtype=np.float32)
-JOINT_MID   = (JOINT_LOWER + JOINT_UPPER) / 2.0
-JOINT_RANGE = (JOINT_UPPER - JOINT_LOWER) / 2.0
+# ── joint limits (per-leg: coxa, femur, tibia) ──────────────────────────────
+JOINT_LOWER_1LEG = np.array([-0.785, -1.571, -1.571], dtype=np.float32)
+JOINT_UPPER_1LEG = np.array([ 0.785,  0.524,  1.571], dtype=np.float32)
+JOINT_MID_1LEG   = (JOINT_LOWER_1LEG + JOINT_UPPER_1LEG) / 2.0
+JOINT_RANGE_1LEG = (JOINT_UPPER_1LEG - JOINT_LOWER_1LEG) / 2.0
+
+JOINT_LOWER = np.tile(JOINT_LOWER_1LEG, 6).astype(np.float32)
+JOINT_UPPER = np.tile(JOINT_UPPER_1LEG, 6).astype(np.float32)
 
 NUM_JOINTS         = 18
-OBS_DIM            = 62
-ACT_DIM            = 18
+ACT_DIM            = 3         
+OBS_DIM            = 48
 SIM_HZ             = 240
 CTRL_HZ            = 50
 SIM_STEPS_PER_CTRL = SIM_HZ // CTRL_HZ
 MAX_EPISODE_STEPS  = 500
 
-# ── POSES ──────────────────────────────────────────────────────────────────────
-# CROUCH: base bottom face on ground, feet also on ground.
-# Geometry (URDF): base half-h=0.012, femur=0.10m, tibia=0.10m
-#   body_z = FEMUR*sin(-0.6458) + TIBIA*sin(-0.6458+1.4522) = 0.012 
-#   foot_z = 0.000 
-CROUCH_POSE = [0.0, -0.6458, 1.4522] * 6
+# leg_id -> joint slice index in the 18-vector (leg_id is 1-indexed, in URDF build order)
+def _slice(leg_id):
+    i = leg_id - 1
+    return slice(3 * i, 3 * i + 3)
 
-# STAND: legs push body up to a stable height
-STAND_POSE  = [0.0, -0.40, 0.90] * 6
+# (master/left leg_id, slave/right leg_id) for front, mid, rear
+MIRROR_PAIRS = [(2, 1), (3, 6), (4, 5)]
 
-# Spawn COM exactly at base half-height so bottom face touches ground
-INITIAL_BASE_HEIGHT = 0.012   # metres
+SIT_POSE_1LEG   = np.array([0.0, -0.6458, 1.4522], dtype=np.float32)
+STAND_POSE_1LEG = np.array([0.0, 0.25, 1.15], dtype=np.float32)
 
-# ── HEIGHT TARGETS ─────────────────────────────────────────────────────────────
-TARGET_HEIGHT = 0.1508    # what we reward agent for standing at
-MIN_HEIGHT    = 0.030   # below this (after grace period) → fallen
-MAX_TILT      = 0.40    # radians
+def expand_mirrored(action_9):
+    """9-dim [front(coxa,femur,tibia), mid(...), rear(...)] (LEFT side)
+       -> full 18-dim joint target vector, mirrored onto the right side."""
+    full = np.zeros(18, dtype=np.float32)
+    groups = [action_9[0:3], action_9[3:6], action_9[6:9]]
+    for (left_id, right_id), g in zip(MIRROR_PAIRS, groups):
+        coxa, femur, tibia = g
+        full[_slice(left_id)]  = [coxa,  femur, tibia]
+        full[_slice(right_id)] = [-coxa, femur, tibia]
+    return full
 
-# ── REWARD WEIGHTS ─────────────────────────────────────────────────────────────
+def build_full_pose(pose_1leg):
+    """Same pose on every leg"""
+    a9 = np.tile(pose_1leg, 3)
+    return expand_mirrored(a9)
+
+SIT_POSE   = build_full_pose(SIT_POSE_1LEG)     # 18-dim, all legs
+STAND_POSE = build_full_pose(STAND_POSE_1LEG)   # 18-dim, all legs
+
+INITIAL_BASE_HEIGHT = 0.012  
+TARGET_HEIGHT       = 0.105    
+MIN_HEIGHT          = 0.050
+MAX_TILT            = 0.70
+
 W_HEIGHT      = 12.0
 W_ALIVE       =  2.0
 W_TILT        = -8.0
@@ -55,7 +89,7 @@ W_VEL         = -2.0
 W_ACTION_RATE = -0.05
 W_FOOT        =  1.5
 W_POSTURE     =  4.0
-SERVO_FORCE   = 25.0
+SERVO_FORCE   = 12.0
 
 
 class HexapodStandEnv(gym.Env):
@@ -89,64 +123,76 @@ class HexapodStandEnv(gym.Env):
             if self.render_mode == "human":
                 self._client = p.connect(p.GUI)
                 p.resetDebugVisualizerCamera(
-                    0.7, 45, -25, [0, 0, 0.15],
-                    physicsClientId=self._client)
+                    0.7, 45, -25, [0, 0, 0.10], physicsClientId=self._client)
             else:
                 self._client = p.connect(p.DIRECT)
 
         p.resetSimulation(physicsClientId=self._client)
-        p.setAdditionalSearchPath(
-            pybullet_data.getDataPath(), physicsClientId=self._client)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=self._client)
         p.setGravity(0, 0, -9.81, physicsClientId=self._client)
         p.setTimeStep(1.0 / SIM_HZ, physicsClientId=self._client)
         p.loadURDF("plane.urdf", physicsClientId=self._client)
 
-        # Spawn upright with base bottom touching ground
         self._robot = p.loadURDF(
-            URDF,
-            [0, 0, INITIAL_BASE_HEIGHT],
-            p.getQuaternionFromEuler([0, 0, 0]),  # always upright
-            useFixedBase=False,
-            physicsClientId=self._client)
+            URDF, [0, 0, INITIAL_BASE_HEIGHT],
+            p.getQuaternionFromEuler([0, 0, 0]),
+            useFixedBase=False, physicsClientId=self._client)
         self._build_joint_index()
 
         for jid in self._joint_ids:
             p.changeDynamics(self._robot, jid,
-                lateralFriction=1.2, spinningFriction=0.1,
-                rollingFriction=0.01, physicsClientId=self._client)
+                lateralFriction=2.5, spinningFriction=0.3,
+                rollingFriction=0.01, frictionAnchor=1,
+                physicsClientId=self._client)
 
-        # Apply crouch — body on ground, feet on ground
+        #(mirrored, symmetric)
         for idx, jid in enumerate(self._joint_ids):
-            p.resetJointState(self._robot, jid, CROUCH_POSE[idx],
-                              physicsClientId=self._client)
+            p.resetJointState(self._robot, jid, float(SIT_POSE[idx]), physicsClientId=self._client)
             p.setJointMotorControl2(
                 self._robot, jid, p.POSITION_CONTROL,
-                targetPosition=CROUCH_POSE[idx],
+                targetPosition=float(SIT_POSE[idx]),
                 force=SERVO_FORCE, physicsClientId=self._client)
 
-        # Let everything settle physically for 1 second
-        for _ in range(SIM_HZ):
+        for step_i in range(SIM_HZ):
+            if step_i < 30:
+                force = SERVO_FORCE * (step_i / 30.0)
+                for idx, jid in enumerate(self._joint_ids):
+                    p.setJointMotorControl2(
+                        self._robot, jid, p.POSITION_CONTROL,
+                        targetPosition=float(SIT_POSE[idx]),
+                        force=force, physicsClientId=self._client)
             p.stepSimulation(physicsClientId=self._client)
 
-        # Kill residual velocity
-        p.resetBaseVelocity(self._robot, [0, 0, 0], [0, 0, 0],
-                            physicsClientId=self._client)
+        p.resetBaseVelocity(self._robot, [0, 0, 0], [0, 0, 0], physicsClientId=self._client)
 
         self._step_count  = 0
         self._prev_action = np.zeros(ACT_DIM, dtype=np.float32)
         return self._get_obs(), {}
 
     def step(self, action):
-        target = np.clip(
-            JOINT_MID + action * JOINT_RANGE,
-            JOINT_LOWER, JOINT_UPPER)
+        action = np.clip(action, -1.0, 1.0).astype(np.float32)
+
+        target_1leg = STAND_POSE_1LEG + action * np.array([0.0, 0.10, 0.10], dtype=np.float32)
+        target_1leg[0] = 0.0 
+
+        target_1leg = np.clip(target_1leg, JOINT_LOWER_1LEG, JOINT_UPPER_1LEG)
+        target18 = build_full_pose(target_1leg)
+
         for idx, jid in enumerate(self._joint_ids):
             p.setJointMotorControl2(
-                self._robot, jid, p.POSITION_CONTROL,
-                targetPosition=float(target[idx]),
-                force=SERVO_FORCE, physicsClientId=self._client)
+                self._robot,
+                jid,
+                p.POSITION_CONTROL,
+                targetPosition=float(target18[idx]),
+                force=SERVO_FORCE,
+                positionGain=0.35,
+                velocityGain=0.35,
+                physicsClientId=self._client,
+            )
+
         for _ in range(SIM_STEPS_PER_CTRL):
             p.stepSimulation(physicsClientId=self._client)
+
         obs = self._get_obs()
         reward, terminated = self._compute_reward(action)
         self._step_count += 1
@@ -155,76 +201,62 @@ class HexapodStandEnv(gym.Env):
         return obs, reward, terminated, truncated, {}
 
     def _get_obs(self):
-        pos, orn = p.getBasePositionAndOrientation(
-            self._robot, physicsClientId=self._client)
-        lin_vel, ang_vel = p.getBaseVelocity(
-            self._robot, physicsClientId=self._client)
+        pos, orn = p.getBasePositionAndOrientation(self._robot, physicsClientId=self._client)
+        lin_vel, ang_vel = p.getBaseVelocity(self._robot, physicsClientId=self._client)
         euler = p.getEulerFromQuaternion(orn)
         jpos, jvel = [], []
         for jid in self._joint_ids:
-            js = p.getJointState(self._robot, jid,
-                                 physicsClientId=self._client)
-            jpos.append(js[0])
-            jvel.append(js[1])
+            js = p.getJointState(self._robot, jid, physicsClientId=self._client)
+            jpos.append(js[0]); jvel.append(js[1])
         return np.concatenate([
-            lin_vel, ang_vel,
-            [euler[0], euler[1]],
-            jpos, jvel,
-            self._prev_action
+            lin_vel,
+            ang_vel,
+            [pos[2], euler[0], euler[1]],
+            jpos,
+            jvel,
+            self._prev_action,
         ]).astype(np.float32)
 
     def _compute_reward(self, action):
-        pos, orn = p.getBasePositionAndOrientation(
-            self._robot, physicsClientId=self._client)
-        lin_vel, _ = p.getBaseVelocity(
-            self._robot, physicsClientId=self._client)
+        pos, orn = p.getBasePositionAndOrientation(self._robot, physicsClientId=self._client)
+        lin_vel, ang_vel = p.getBaseVelocity(self._robot, physicsClientId=self._client)
         euler = p.getEulerFromQuaternion(orn)
-        height = pos[2]
-        tilt   = abs(euler[0]) + abs(euler[1])
-        speed  = float(np.sqrt(lin_vel[0]**2 + lin_vel[1]**2))
+
+        height = float(pos[2])
+        roll = float(euler[0])
+        pitch = float(euler[1])
+        tilt = abs(roll) + abs(pitch)
+
+        xy_speed = float(np.sqrt(lin_vel[0] ** 2 + lin_vel[1] ** 2))
+        ang_speed = float(np.sqrt(ang_vel[0] ** 2 + ang_vel[1] ** 2 + ang_vel[2] ** 2))
 
         jpos = np.array([
-            p.getJointState(self._robot, jid,
-                            physicsClientId=self._client)[0]
+            p.getJointState(self._robot, jid, physicsClientId=self._client)[0]
             for jid in self._joint_ids
-        ])
-        posture_error = np.mean(np.abs(jpos - np.array(STAND_POSE)))
+        ], dtype=np.float32)
 
-        height_rew  = np.exp(-15.0 * abs(height - TARGET_HEIGHT))
-        contacts    = p.getContactPoints(self._robot,
-                                         physicsClientId=self._client)
-        n_feet      = len(set(c[3] for c in contacts)) if contacts else 0
+        posture_error = float(np.mean(np.square(jpos - STAND_POSE)))
+
+        height_reward = np.exp(-35.0 * abs(height - TARGET_HEIGHT))
+        posture_reward = np.exp(-8.0 * posture_error)
+
         action_rate = float(np.sum(np.square(action - self._prev_action)))
 
         reward = (
-            W_HEIGHT      * height_rew
-            + W_ALIVE
-            + W_TILT      * tilt
-            + W_VEL       * speed
-            + W_ACTION_RATE * action_rate
-            + W_FOOT      * n_feet
-            + W_POSTURE   * (1.0 - np.clip(posture_error * 2.0, 0, 1.0))
+            10.0 * height_reward
+            + 8.0 * posture_reward
+            + 1.0
+            - 10.0 * tilt
+            - 8.0 * xy_speed
+            - 2.0 * ang_speed
+            - 0.10 * action_rate
         )
 
-        terminated = bool(
-            self._step_count > 20
-            and (height < MIN_HEIGHT or tilt > MAX_TILT)
-        )
+        terminated = bool(self._step_count > 30 and (height < MIN_HEIGHT or tilt > MAX_TILT))
         if terminated:
-            reward -= 20.0
-        return float(reward), terminated
+            reward -= 25.0
 
-    def render(self):
-        if self.render_mode == "rgb_array":
-            w, h = 640, 480
-            view = p.computeViewMatrixFromYawPitchRoll(
-                [0, 0, 0.15], 0.7, 45, -25, 0, 2,
-                physicsClientId=self._client)
-            proj = p.computeProjectionMatrixFOV(
-                60, w/h, 0.01, 100, physicsClientId=self._client)
-            _, _, rgb, _, _ = p.getCameraImage(
-                w, h, view, proj, physicsClientId=self._client)
-            return np.array(rgb, dtype=np.uint8)[:, :, :3]
+        return float(reward), terminated
 
     def close(self):
         if self._client is not None:
@@ -234,24 +266,30 @@ class HexapodStandEnv(gym.Env):
 
 if __name__ == "__main__":
     import time
-    print("Testing — body should rest on ground in crouch, then lift to stand...")
+    print("Sanity check — should settle in SIT pose (belly+feet on ground), no drifting.")
     env = HexapodStandEnv(render_mode="human")
     obs, _ = env.reset()
-
-    base_pos, _ = p.getBasePositionAndOrientation(
-        env._robot, physicsClientId=env._client)
+    base_pos, _ = p.getBasePositionAndOrientation(env._robot, physicsClientId=env._client)
     print(f"  Body COM z after settle = {base_pos[2]:.4f} m  (target ~0.012)")
 
-    stand_action = np.clip(
-        (np.array(STAND_POSE, dtype=np.float32) - JOINT_MID) / JOINT_RANGE,
-        -1, 1)
+    stand_action = np.zeros(3, dtype=np.float32)
+
     total = 0
-    for i in range(500):
+    for i in range(1500):
         obs, reward, terminated, truncated, _ = env.step(stand_action)
         total += reward
         time.sleep(1 / CTRL_HZ)
+
+        if i % 50 == 0:
+            base_pos, orn = p.getBasePositionAndOrientation(env._robot, physicsClientId=env._client)
+            lin_vel, ang_vel = p.getBaseVelocity(env._robot, physicsClientId=env._client)
+            print(
+                f"step={i}, z={base_pos[2]:.3f}, "
+                f"xy_speed={(lin_vel[0]**2 + lin_vel[1]**2)**0.5:.4f}, "
+                f"ang_speed={(ang_vel[0]**2 + ang_vel[1]**2 + ang_vel[2]**2)**0.5:.4f}, "
+                f"reward={reward:.2f}"
+            )
+
         if terminated or truncated:
-            print(f"  Ended at step {i}  reward={total:.1f}")
+            print(f"Ended at step {i}, reward={total:.1f}")
             break
-    print(f"  Total reward = {total:.1f}")
-    env.close()

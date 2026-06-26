@@ -40,7 +40,7 @@ LEARNING_RATE   = 3e-4
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_RANGE      = 0.2
-ENT_COEF        = 0.005 
+ENT_COEF        = 0.0
 CHECKPOINT_FREQ = 50_000
 
 
@@ -144,7 +144,7 @@ def main():
             ent_coef=ENT_COEF,
             verbose=0,
             tensorboard_log=LOG_DIR,
-            policy_kwargs=dict(net_arch=[256, 256])
+            policy_kwargs=dict(net_arch=[128, 128], log_std_init=-2.0)
         )
 
     try:

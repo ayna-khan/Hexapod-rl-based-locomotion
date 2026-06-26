@@ -42,7 +42,7 @@ LEARNING_RATE   = 2e-4
 GAMMA           = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_RANGE      = 0.2
-ENT_COEF        = 0.02   # higher entropy → more exploration early on
+ENT_COEF        = 0.02   
 
 
 class ProgressCallback(BaseCallback):
@@ -67,7 +67,6 @@ class ProgressCallback(BaseCallback):
         mean_r  = sum(rewards) / len(rewards)
         mean_l  = sum(lengths) / len(lengths)
 
-        # Diagnose
         if mean_r < 30 and self.num_timesteps > 500_000:
             status = " LOW — may still be standing still"
         elif mean_r > 200 and mean_l > 500:
@@ -163,7 +162,7 @@ def main():
             ent_coef=ENT_COEF,
             verbose=0,
             tensorboard_log=LOG_DIR,
-            policy_kwargs=dict(net_arch=[512, 256, 128])
+            policy_kwargs=dict(net_arch=[512, 256, 128], log_std_init=-1.0)
         )
 
     try:

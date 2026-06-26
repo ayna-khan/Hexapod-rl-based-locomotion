@@ -1,12 +1,12 @@
 """
-CRAWL — Stage 2 Enjoy: Watch the hexapod walk
+CRAWL — Stage 2 Visualize: Watch the hexapod walk
 ==============================================
 Shows live telemetry per step: x-displacement, body height, feet on ground, vx.
 
 Usage:
-  python3 enjoy_stage2.py                      # watch best model
-  python3 enjoy_stage2.py --slow               # 0.5x speed
-  python3 enjoy_stage2.py --model path/to.zip  # specific checkpoint
+  python3 visualize_stage2.py                      # watch best model
+  python3 visualize_stage2.py --slow               # 0.5x speed
+  python3 visualize_stage2.py --model path/to.zip  # specific checkpoint
 """
 
 import os, argparse, time, glob
@@ -37,7 +37,6 @@ def get_raw_env(vec_env):
         env = env.venv
     if hasattr(env, "envs"):
         env = env.envs[0]
-    # Unwrap Monitor if present
     while hasattr(env, "env"):
         env = env.env
     return env
@@ -85,12 +84,36 @@ def main():
     print(f"{'─'*72}")
 
     try:
+        camera_distance = 1.2
+        camera_yaw = 45
+        camera_pitch = -25
         for step in range(args.steps):
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, info = vec_env.step(action)
             ep_reward += float(reward[0])
             ep_steps  += 1
+            
+            keys = p.getKeyboardEvents()
 
+            if ord("z") in keys and keys[ord("z")] & p.KEY_WAS_TRIGGERED:
+                camera_distance = max(0.25, camera_distance - 0.15)
+
+            if ord("x") in keys and keys[ord("x")] & p.KEY_WAS_TRIGGERED:
+                camera_distance = min(4.0, camera_distance + 0.15)
+
+            raw_env = get_raw_env(vec_env)
+            pos, _ = p.getBasePositionAndOrientation(
+                raw_env._robot,
+                physicsClientId=raw_env._client,
+            )
+
+            p.resetDebugVisualizerCamera(
+                cameraDistance=camera_distance,
+                cameraYaw=camera_yaw,
+                cameraPitch=camera_pitch,
+                cameraTargetPosition=[pos[0], pos[1], 0.10],
+                physicsClientId=raw_env._client,
+            )
             # Telemetry from raw env
             try:
                 pos, _ = p.getBasePositionAndOrientation(

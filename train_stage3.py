@@ -22,19 +22,9 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
 
 from hexapod_env_stage3 import (
-    HexapodGoalEnv,
-    JOINT_LOWER, JOINT_UPPER, STAND_POSE,
-    NUM_JOINTS, SIM_HZ, CTRL_HZ, SIM_STEPS_PER_CTRL,
-    TARGET_HEIGHT, SPAWN_Z, MIN_HEIGHT, MAX_TILT,
-    ACTION_SCALE, SERVO_FORCE,
-    GOAL_RADIUS, GOAL_MIN_DIST,
-    ACT_DIM,
+    HexapodGoalEnv, ACT_DIM, OBS_DIM,
+    GOAL_MIN_DIST, GOAL_MAX_DIST,
 )
-
-import pybullet as p
-import pybullet_data
-import gymnasium as gym
-from gymnasium import spaces
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 STAGE2_DIR = os.path.join(BASE_DIR, "checkpoints_stage2")
@@ -63,211 +53,6 @@ CURRICULUM = [
     (0.30, 2.5),
     (0.60, 3.0),
 ]
-
-W_VEL_TOWARD  =  5.0
-W_PROGRESS    = 15.0
-W_GOAL        = 200.0
-W_HEIGHT      =  2.0
-W_TILT        = -2.0
-W_ALIVE       =  0.1
-W_ENERGY      = -0.001
-W_ACTION_RATE = -0.002
-W_STALL       = -2.0
-
-STALL_STEPS   = 20
-STALL_THRESH  = 0.005
-GRACE_STEPS   = 200
-
-OBS_DIM           = 72
-GOAL_MAX_DIST_DEFAULT = 3.0
-
-
-class HexapodGoalEnvFixed(HexapodGoalEnv):
-    """
-    Drop-in replacement for HexapodGoalEnv with two changes:
-      1. Obs uses a direct vector to goal instead of A* waypoints.
-      2. Debug line is a single straight line from spawn to goal.
-    Everything else (reward, physics, termination) is identical to the base env.
-    """
-
-    def __init__(self, max_goal_dist=GOAL_MAX_DIST_DEFAULT, **kwargs):
-        super().__init__(**kwargs)
-        self._max_goal_dist = float(max_goal_dist)
-        self._min_goal_dist = GOAL_MIN_DIST
-
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32)
-        self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(ACT_DIM,), dtype=np.float32)
-
-        self._stall_buf = []
-
-    def set_max_goal_dist(self, d: float):
-        self._max_goal_dist = float(d)
-
-    def reset(self, *, seed=None, options=None):
-        obs, info = super().reset(seed=seed, options=options)
-
-        # Resample goal with curriculum distance range
-        if self.fixed_goal is None:
-            rng = self.np_random
-            for _ in range(500):
-                angle = rng.uniform(0, 2 * np.pi)
-                dist  = rng.uniform(self._min_goal_dist, self._max_goal_dist)
-                gx    = float(dist * np.cos(angle))
-                gy    = float(dist * np.sin(angle))
-                self._goal_xy = np.array([gx, gy], dtype=np.float32)
-                break
-            try:
-                self._spawn_goal_marker(*self._goal_xy)
-            except Exception:
-                pass
-
-        # line from the spawn point directly to the goal.
-        if self.render_mode == "human":
-            try:
-                p.removeAllUserDebugItems(physicsClientId=self._client)
-                p.addUserDebugLine(
-                    [0.0, 0.0, 0.02],
-                    [float(self._goal_xy[0]), float(self._goal_xy[1]), 0.02],
-                    lineColorRGB=[0, 1, 0],
-                    lineWidth=3.0,
-                    physicsClientId=self._client)
-            except Exception:
-                pass
-
-        # Use goal itself as the single waypoint 
-        self._waypoints = [tuple(self._goal_xy)]
-        self._wp_idx    = 0
-
-        try:
-            pos, _ = p.getBasePositionAndOrientation(
-                self._robot, physicsClientId=self._client)
-            self._prev_dist = float(np.linalg.norm(
-                np.array([pos[0], pos[1]]) - self._goal_xy))
-        except Exception:
-            self._prev_dist = float(self._max_goal_dist)
-
-        self._stall_buf = [self._prev_dist] * STALL_STEPS
-
-        return self._get_obs_fixed(), info
-
-    def _get_obs_fixed(self):
-        pos, orn         = p.getBasePositionAndOrientation(
-            self._robot, physicsClientId=self._client)
-        lin_vel, ang_vel = p.getBaseVelocity(
-            self._robot, physicsClientId=self._client)
-        euler            = p.getEulerFromQuaternion(orn)
-
-        jpos, jvel = [], []
-        for jid in self._joint_ids:
-            js = p.getJointState(self._robot, jid,
-                                 physicsClientId=self._client)
-            jpos.append(js[0])
-            jvel.append(js[1])
-
-        xy = np.array([pos[0], pos[1]], dtype=np.float32)
-
-        rel_goal  = self._goal_xy - xy
-        dist_goal = float(np.linalg.norm(rel_goal))
-
-        if dist_goal > 1e-6:
-            goal_dir_norm = rel_goal / dist_goal
-        else:
-            goal_dir_norm = np.zeros(2, dtype=np.float32)
-
-        dist_goal_norm = float(np.clip(dist_goal / self._max_goal_dist, 0.0, 1.0))
-
-        yaw         = float(euler[2])
-        goal_angle  = float(np.arctan2(
-            self._goal_xy[1] - pos[1],
-            self._goal_xy[0] - pos[0]))
-        heading_err = float(np.arctan2(
-            np.sin(goal_angle - yaw),
-            np.cos(goal_angle - yaw)))
-
-        return np.concatenate([
-            lin_vel,
-            ang_vel,
-            [euler[0], euler[1]],
-            jpos,
-            jvel,
-            self._prev_action,
-            goal_dir_norm,
-            [dist_goal_norm],
-            [heading_err / np.pi],
-        ]).astype(np.float32)
-
-    def _get_obs(self):
-        return self._get_obs_fixed()
-
-    def _compute_reward(self, action):
-        pos, orn   = p.getBasePositionAndOrientation(
-            self._robot, physicsClientId=self._client)
-        lin_vel, _ = p.getBaseVelocity(
-            self._robot, physicsClientId=self._client)
-        euler      = p.getEulerFromQuaternion(orn)
-
-        xy        = np.array([pos[0], pos[1]], dtype=np.float32)
-        height    = float(pos[2])
-        tilt      = float(abs(euler[0]) + abs(euler[1]))
-        dist_goal = float(np.linalg.norm(xy - self._goal_xy))
-
-        progress        = self._prev_dist - dist_goal
-        self._prev_dist = dist_goal
-
-        self._stall_buf.pop(0)
-        self._stall_buf.append(dist_goal)
-        stall_progress = self._stall_buf[0] - self._stall_buf[-1]
-        stall_penalty  = W_STALL if stall_progress < STALL_THRESH else 0.0
-
-        rel_goal     = self._goal_xy - xy
-        dist_to_goal = float(np.linalg.norm(rel_goal))
-        if dist_to_goal > 1e-6:
-            goal_unit = rel_goal / dist_to_goal
-        else:
-            goal_unit = np.zeros(2, dtype=np.float32)
-        vel_toward = float(np.dot(
-            np.array([lin_vel[0], lin_vel[1]], dtype=np.float32),
-            goal_unit))
-
-        height_rew = float(np.exp(-20.0 * abs(height - TARGET_HEIGHT)))
-
-        torques = [p.getJointState(self._robot, jid,
-                    physicsClientId=self._client)[3]
-                   for jid in self._joint_ids]
-        energy  = float(np.sum(np.abs(torques)))
-
-        action_rate = float(np.sum(np.square(action - self._prev_action)))
-
-        reward = (
-            W_VEL_TOWARD  * vel_toward   +
-            W_PROGRESS    * progress     +
-            stall_penalty               +
-            W_HEIGHT      * height_rew   +
-            W_TILT        * tilt         +
-            W_ALIVE                      +
-            W_ENERGY      * energy       +
-            W_ACTION_RATE * action_rate
-        )
-
-        terminated = False
-        info       = {"dist_to_goal": dist_goal, "success": False}
-
-        if dist_goal < GOAL_RADIUS:
-            reward    += W_GOAL
-            terminated = True
-            info["success"] = True
-        elif self._step_count > GRACE_STEPS and (
-                height < MIN_HEIGHT or tilt > MAX_TILT):
-            reward    -= 10.0
-            terminated = True
-
-        return float(reward), terminated, info
-
-
-class CurriculumGoalEnv(HexapodGoalEnvFixed):
-    pass
 
 
 class CurriculumCallback(BaseCallback):
@@ -362,9 +147,8 @@ class ProgressCallback(BaseCallback):
 
 def make_env():
     def _init():
-        env = CurriculumGoalEnv(render_mode=None)
-        env = Monitor(env)
-        return env
+        env = HexapodGoalEnv(render_mode=None)
+        return Monitor(env)
     return _init
 
 
@@ -382,10 +166,9 @@ def find_stage2_model():
 def _load_stage2_weights(model: PPO, stage2_path: str):
     """
     Copy weights from Stage-2 into Stage-3 where tensor shapes match.
-    The first MLP layer is skipped because Stage-2 has 62-D obs vs 72-D here;
-    all hidden layers and output heads transfer if net_arch is the same.
+    The first MLP layer is skipped because Stage-2 has a 53-D obs vs 57-D here;
+    all hidden layers and output heads transfer since net_arch and ACT_DIM (9) match.
     """
-    import torch
     try:
         s2 = PPO.load(stage2_path)
     except Exception as e:
